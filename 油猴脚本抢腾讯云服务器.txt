@@ -1,0 +1,322 @@
+// ==UserScript==
+// @name         Tencent Cloud Seckill Assistant
+// @namespace    http://tampermonkey.net/
+// @version      6.0
+// @description  Automates server purchase with pre-flight check and silent risk handling.
+// @author       You
+// @match        *://cloud.tencent.com/act/*
+// @grant        GM_xmlhttpRequest
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Configuration
+    const ACTIVITY_ID = 161547245039553;
+    const TARGET_REGIONS = [1, 4, 8];
+    const LOG_PREFIX = "[TencentSeckill] ";
+
+    // Target product data (Actual purchase)
+    const TARGET_DO_GOODS_DATA = {
+        "activity_id": ACTIVITY_ID,
+        "agent_channel": { "fromChannel": "", "fromSales": "", "isAgentClient": false, "fromUrl": "" },
+        "business": { "id": 22755, "from": "lightningDeals" },
+        "goods": [{
+            "act_id": 1751269793667590,
+            "type": "bundle_budget_mc_lg4_01",
+            "goods_param": {
+                "BlueprintId": "LINUX_UNIX", "area": 1, "ddocUnionConnect": 0, "goodsNum": 1,
+                "imageId": "lhbp-eqora508", "scenario": "0", "timeSpanUnit": "12m", "zone": "",
+                "regionId": null, "type": "bundle_budget_mc_lg4_01"
+            }
+        }],
+        "preview": 0 
+    };
+
+    // Probe product data (Pre-flight check for face/real-name validation)
+    const PROBE_DO_GOODS_DATA = {
+        "activity_id": ACTIVITY_ID,
+        "agent_channel": { "fromChannel": "", "fromSales": "", "isAgentClient": false, "fromUrl": "" },
+        "business": { "id": 22755, "from": "lightningDeals" },
+        "goods": [{
+            "act_id": 1736739889278940,
+            "type": "lighthouse_v5", 
+            "goods_param": { "goodsNum": 1 }
+        }],
+        "preview": 1
+    };
+
+    // Token Interceptor
+    let AUTO_CSRF_TOKEN = "";
+
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const options = args[1];
+        if (options && options.headers) {
+            let token = (options.headers instanceof Headers) 
+                ? (options.headers.get('x-csrf-token') || options.headers.get('X-CSRF-Token'))
+                : (options.headers['x-csrf-token'] || options.headers['X-CSRF-Token']);
+            
+            if (token && token !== AUTO_CSRF_TOKEN) {
+                AUTO_CSRF_TOKEN = token;
+                console.log(`${LOG_PREFIX}Fetch token updated:`, AUTO_CSRF_TOKEN);
+            }
+        }
+        return originalFetch.apply(this, args);
+    };
+
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+        if (header.toLowerCase() === 'x-csrf-token' && value !== AUTO_CSRF_TOKEN) {
+            AUTO_CSRF_TOKEN = value;
+            console.log(`${LOG_PREFIX}XHR token updated:`, AUTO_CSRF_TOKEN);
+        }
+        return originalSetRequestHeader.apply(this, arguments);
+    };
+
+    function getFallbackToken() {
+        const cookies = document.cookie.split('; ');
+        let target = "";
+        for (let c of cookies) {
+            if (c.startsWith('p_skey=') || c.startsWith('skey=') || c.startsWith('qcloud_token=')) {
+                target = c.split('=')[1]; break;
+            }
+        }
+        if (target) {
+            let hash = 5381;
+            for (let i = 0, len = target.length; i < len; ++i) hash += (hash << 5) + target.charCodeAt(i);
+            return (hash & 0x7fffffff).toString();
+        }
+        return "";
+    }
+
+    // Network Request Handler
+    function sendPostRequest(url, data) {
+        return new Promise((resolve, reject) => {
+            let finalToken = AUTO_CSRF_TOKEN || getFallbackToken();
+            if (!finalToken) console.warn(`${LOG_PREFIX}Warning: CSRF token is missing.`);
+            
+            if(data.agent_channel) data.agent_channel.fromUrl = window.location.href; 
+            
+            GM_xmlhttpRequest({
+                method: 'POST', url: url, 
+                headers: { "x-csrf-token": finalToken, "Content-Type": "application/json", "Referer": window.location.href }, 
+                data: JSON.stringify(data),
+                onload: function(response) {
+                    try { resolve(JSON.parse(response.responseText)); }
+                    catch (e) { reject(new Error(`Parse failed. Status: ${response.status}`)); }
+                },
+                onerror: function(error) { reject(error); }
+            });
+        });
+    }
+
+    // Pre-flight Check (Qualification & Risk)
+    async function checkQualification() {
+        const checkData = JSON.parse(JSON.stringify(PROBE_DO_GOODS_DATA));
+
+        try {
+            console.log(`${LOG_PREFIX}Initiating pre-flight qualification check...`);
+            const result = await sendPostRequest("https://act-api.cloud.tencent.com/dianshi/do-goods", checkData);
+            
+            const errorMsg = result.msg || result.message || "";
+            const errorCode = result.code;
+
+            // 1. Silent fail for high-risk accounts (1100201)
+            if (errorCode === 1100201 || errorMsg.includes("风险")) {
+                console.log(`${LOG_PREFIX}Account flagged for risk. Aborting silently.`);
+                return { ok: false, silent: true };
+            }
+
+            // 2. Face recognition / Real-name check popup (1100202)
+            const riskKeywords = ["实名", "人脸", "认证", "拦截", "限制", "身份", "核身校验"];
+            const isBlocked = errorCode === 1100202 || riskKeywords.some(kw => errorMsg.includes(kw));
+
+            if (isBlocked) {
+                let authUrl = "https://console.cloud.tencent.com/developer/auth"; 
+                const urlMatch = errorMsg.match(/href=\\?["'](https:\/\/[^"'\\]+)/);
+                
+                if (urlMatch && urlMatch[1]) {
+                    authUrl = urlMatch[1];
+                } else if (errorCode === 1100202 || errorMsg.includes("人脸")) {
+                    authUrl = "https://cloud.tencent.com/act/pro/face_authentication";
+                }
+
+                // Automatically open auth window
+                window.open(authUrl, 'TencentAuthWindow', 'width=800,height=600,left=200,top=100');
+
+                return { 
+                    ok: false, 
+                    silent: false,
+                    msg: `提示：此账号需要进行实名或人脸验证。\n\n系统已自动弹出验证窗口，请完成验证后关闭该窗口，并重新点击启动脚本。` 
+                };
+            }
+
+            // 3. Normal / Safe
+            return { ok: true }; 
+
+        } catch (e) {
+            console.warn(`${LOG_PREFIX}Pre-flight request failed, bypassing check.`, e);
+            return { ok: true }; 
+        }
+    }
+
+    // Time Utilities
+    function getNextSeckillTime() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const date = now.getDate();
+        const time10 = new Date(year, month, date, 10, 0, 0).getTime();
+        const time15 = new Date(year, month, date, 15, 0, 0).getTime();
+        const currentMs = now.getTime();
+
+        if (currentMs < time10) return time10;
+        else if (currentMs < time15) return time15;
+        else return new Date(year, month, date + 1, 10, 0, 0).getTime();
+    }
+
+    function formatTime(ms) {
+        const d = new Date(ms);
+        return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+
+    async function getServerTime() {
+        return new Promise((resolve) => {
+            const timeUrl = window.location.href.split('#')[0] + (window.location.href.includes('?') ? '&' : '?') + '_t=' + Date.now();
+            GM_xmlhttpRequest({
+                method: 'HEAD', url: timeUrl,
+                onload: function(response) {
+                    try {
+                        const match = response.responseHeaders.match(/date:\s*(.*)/i);
+                        if (match && match[1]) resolve(new Date(match[1]).getTime());
+                        else throw new Error("Missing Date Header");
+                    } catch (e) { resolve(Date.now()); }
+                },
+                onerror: function() { resolve(Date.now()); }
+            });
+        });
+    }
+
+    // Main Execution
+    async function buyNow(regionId) {
+        const doData = JSON.parse(JSON.stringify(TARGET_DO_GOODS_DATA));
+        doData.goods[0].goods_param.regionId = regionId;
+        
+        try {
+            const result = await sendPostRequest("https://act-api.cloud.tencent.com/dianshi/do-goods", doData);
+            console.log(`${LOG_PREFIX}Region ${regionId} Result:`, result);
+            return { regionId, ...result };
+        } catch (e) { return { regionId, code: -1, error: e.message }; }
+    }
+
+    async function runConcurrentBuy() {
+        const panel = document.getElementById('tencent-seckill-panel');
+        if(panel) panel.innerHTML = '正在处理...';
+        
+        const results = await Promise.all(TARGET_REGIONS.map(rid => buyNow(rid)));
+        const success = results.find(r => r.code === 0);
+        
+        if (success) {
+            alert(`抢购成功！(地域: ${success.regionId})，请前往订单中心支付。`);
+            if(panel) { panel.innerHTML = `抢购成功`; panel.style.backgroundColor = '#52c41a'; }
+        } else {
+            // Check if it failed due to silent risk (1100201) during final execution
+            const isRisk = results.some(r => r.code === 1100201 || (r.msg && r.msg.includes("风险")));
+            if (isRisk) {
+                if(panel) { panel.innerHTML = '任务已终止'; panel.style.backgroundColor = '#8c8c8c'; }
+            } else {
+                let failReason = "失败";
+                if (results[0]) failReason = results[0].msg || results[0].message || `Error Code: ${results[0].code}`;
+                if(panel) { 
+                    panel.innerHTML = `抢购失败: ${failReason}`; 
+                    panel.style.backgroundColor = '#ff4d4f'; 
+                }
+            }
+        }
+    }
+
+    // UI Initialization
+    function initUI() {
+        if (document.getElementById('tencent-seckill-panel')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'tencent-seckill-panel';
+        panel.innerHTML = '助手模块 (点击启动)';
+        panel.style.cssText = 'position:fixed;top:100px;right:20px;z-index:9999;padding:15px;background-color:#00a4ff;color:white;border:none;border-radius:5px;cursor:pointer;font-size:14px;box-shadow: 0 2px 4px rgba(0,0,0,0.2); text-align:center;';
+        document.body.appendChild(panel);
+
+        let seckillActive = false;
+        let countdownInterval = null;
+
+        panel.onclick = async () => {
+            if (!seckillActive) {
+                let currentToken = AUTO_CSRF_TOKEN || getFallbackToken();
+                if (!currentToken) {
+                    alert("请在页面中点击任意商品触发网络请求后再启动。");
+                    return;
+                }
+
+                try {
+                    panel.innerHTML = '状态检查中...';
+                    panel.style.backgroundColor = '#faad14';
+                    
+                    const checkRes = await checkQualification();
+                    
+                    if (!checkRes.ok) {
+                        if (checkRes.silent) {
+                            panel.innerHTML = '任务已终止';
+                            panel.style.backgroundColor = '#8c8c8c';
+                        } else {
+                            alert(checkRes.msg);
+                            panel.innerHTML = '需完成验证';
+                            panel.style.backgroundColor = '#ff4d4f';
+                        }
+                        return; // Terminate execution
+                    }
+
+                    const seckillTimeMs = getNextSeckillTime();
+                    const serverTimeMs = await getServerTime();
+                    const timeDiffMs = seckillTimeMs - serverTimeMs;
+
+                    if (timeDiffMs > 0) {
+                        seckillActive = true;
+                        
+                        setTimeout(() => { console.log(`${LOG_PREFIX}Wave 1`); runConcurrentBuy(); }, timeDiffMs - 300);
+                        setTimeout(() => { console.log(`${LOG_PREFIX}Wave 2`); runConcurrentBuy(); }, timeDiffMs);
+                        setTimeout(() => { console.log(`${LOG_PREFIX}Wave 3`); runConcurrentBuy(); }, timeDiffMs + 500);
+                        
+                        countdownInterval = setInterval(() => {
+                            if (!seckillActive) { clearInterval(countdownInterval); return; }
+                            const remainingMs = seckillTimeMs - Date.now();
+                            if (remainingMs > 0) {
+                                panel.innerHTML = `执行就绪 | ${formatTime(seckillTimeMs)}<br>倒计时：${Math.round(remainingMs / 1000)}s`;
+                            } else {
+                                clearInterval(countdownInterval);
+                            }
+                        }, 1000);
+                    } else {
+                        runConcurrentBuy();
+                    }
+                } catch (err) {
+                    console.error("Initialization failed:", err);
+                    panel.innerHTML = '启动异常';
+                    panel.style.backgroundColor = '#ff4d4f';
+                }
+            } else {
+                seckillActive = false;
+                if (countdownInterval) clearInterval(countdownInterval);
+                panel.innerHTML = '助手模块 (已暂停)';
+                panel.style.backgroundColor = '#00a4ff';
+            }
+        };
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initUI);
+    } else {
+        initUI();
+    }
+
+})();
